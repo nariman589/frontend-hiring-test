@@ -3,23 +3,27 @@ import { ItemContent, Virtuoso } from "react-virtuoso";
 import cn from "clsx";
 import { gql, useQuery, useMutation, useSubscription } from "@apollo/client";
 import {
+  Message,
   MessageSender,
   MessageStatus,
-  type Message,
 } from "../__generated__/resolvers-types";
 import css from "./chat.module.css";
 
-// GraphQL Operations
+// Типы данных для GraphQL операций
+interface MessagesData {
+  messages: {
+    edges: Array<{ node: Message; cursor: string }>;
+    pageInfo: { endCursor: string; hasNextPage: boolean };
+  };
+}
+
+// GraphQL запросы
 const GET_MESSAGES = gql`
   query GetMessages($first: Int, $after: MessagesCursor) {
     messages(first: $first, after: $after) {
       edges {
         node {
-          id
-          text
-          status
-          updatedAt
-          sender
+          id text status updatedAt sender
         }
         cursor
       }
@@ -34,11 +38,7 @@ const GET_MESSAGES = gql`
 const SEND_MESSAGE = gql`
   mutation SendMessage($text: String!) {
     sendMessage(text: $text) {
-      id
-      text
-      status
-      updatedAt
-      sender
+      id text status updatedAt sender
     }
   }
 `;
@@ -46,11 +46,7 @@ const SEND_MESSAGE = gql`
 const MESSAGE_ADDED = gql`
   subscription OnMessageAdded {
     messageAdded {
-      id
-      text
-      status
-      updatedAt
-      sender
+      id text status updatedAt sender
     }
   }
 `;
@@ -58,158 +54,126 @@ const MESSAGE_ADDED = gql`
 const MESSAGE_UPDATED = gql`
   subscription OnMessageUpdated {
     messageUpdated {
-      id
-      text
-      status
-      updatedAt
-      sender
+      id text status updatedAt sender
     }
   }
 `;
 
-const Item: React.FC<Message> = ({ text, sender, status }) => {
-  return (
-    <div className={css.item}>
-      <div
-        className={cn(
-          css.message,
-          sender === MessageSender.Admin ? css.out : css.in
-        )}
-      >
-        {text}
-        {status === MessageStatus.Sending && " (sending...)"}
-        {status === MessageStatus.Read && " ✓✓"}
-        {status === MessageStatus.Sent && " ✓"}
-      </div>
+// Компонент для отображения одного сообщения
+const MessageItem: React.FC<Message> = ({ text, sender, status }) => (
+  <div className={css.item}>
+    <div className={cn(css.message, sender === MessageSender.Admin ? css.out : css.in)}>
+      {text}
+      {status === MessageStatus.Sending && " (sending...)"}
+      {status === MessageStatus.Read && " ✓✓"}
+      {status === MessageStatus.Sent && " ✓"}
     </div>
-  );
-};
+  </div>
+);
 
-const getItem: ItemContent<Message, unknown> = (_, data) => {
-  return <Item {...data} />;
-};
+const MESSAGES_PER_PAGE = 20;
 
 export const Chat: React.FC = () => {
   const [inputText, setInputText] = useState("");
-  
-  // Query for fetching messages with pagination
+
+  // Получение сообщений с пагинацией
   const { data, loading, error, fetchMore } = useQuery<MessagesData>(GET_MESSAGES, {
-    variables: { first: 20 },
+    variables: { first: MESSAGES_PER_PAGE },
   });
 
-  // Mutation for sending messages
-  const [sendMessage] = useMutation(SEND_MESSAGE, {
-    optimisticResponse: ({ text }) => ({
-      sendMessage: {
-        __typename: "Message",
-        id: `temp-${Date.now()}`,
-        text,
-        status: MessageStatus.Sending,
-        updatedAt: new Date().toISOString(),
-        sender: MessageSender.Admin,
-      }
-    }),
-    update(cache, { data: { sendMessage: newMessage } }) {
-      const existing = cache.readQuery<MessagesData>({ 
-        query: GET_MESSAGES,
-        variables: { first: 20 }
-      });
-      
-      if (!existing) return;
+  // Мутация для отправки сообщения
+  const [sendMessage] = useMutation(SEND_MESSAGE);
 
-      // Check if message already exists in cache
-      const exists = existing.messages.edges.some(
-        (edge: Edge) => edge.node.id === newMessage.id
-      );
-      
-      if (!exists) {
-        cache.writeQuery({
-          query: GET_MESSAGES,
-          variables: { first: 20 },
-          data: {
-            messages: {
-              ...existing.messages,
-              edges: [
-                ...existing.messages.edges,
-                { 
-                  __typename: "MessageEdge",
-                  node: newMessage,
-                  cursor: newMessage.id 
-                }
-              ]
-            }
-          }
-        });
-      }
-    }
-  });
-
-  // Subscription for new messages
+  // Подписка на новые сообщения
   useSubscription(MESSAGE_ADDED, {
     onData: ({ client, data }) => {
-      const newMessage = data.data.messageAdded;
-      
+      if (!data.data?.messageAdded) return;
+
       const existing = client.cache.readQuery<MessagesData>({
         query: GET_MESSAGES,
-        variables: { first: 20 }
+        variables: { first: MESSAGES_PER_PAGE }
       });
-      
+
       if (!existing) return;
 
-      // Check if message already exists (including temp messages)
-      const exists = existing.messages.edges.some(
-        (edge: Edge) => 
-          edge.node.id === newMessage.id || 
-          (edge.node.text === newMessage.text && 
-           edge.node.sender === newMessage.sender &&
-           edge.node.id.startsWith('temp-'))
+      // Проверяем, не устарело ли новое сообщение
+      const existingMessage = existing.messages.edges.find(
+        edge => edge.node.id === data.data.messageAdded.id
       );
-      
-      if (!exists) {
-        client.cache.writeQuery({
-          query: GET_MESSAGES,
-          variables: { first: 20 },
-          data: {
-            messages: {
-              ...existing.messages,
-              edges: [
-                ...existing.messages.edges.filter(
-                  edge => !edge.node.id.startsWith('temp-') || 
-                         edge.node.text !== newMessage.text || 
-                         edge.node.sender !== newMessage.sender
-                ),
-                { 
-                  __typename: "MessageEdge",
-                  node: newMessage,
-                  cursor: newMessage.id 
-                }
-              ]
-            }
-          }
-        });
-      }
-    }
-  });
 
-  // Subscription for message updates
-  useSubscription(MESSAGE_UPDATED, {
-    onData: ({ client, data }) => {
-      const updatedMessage = data.data.messageUpdated;
-      
-      // Update the specific message in cache
-      client.cache.modify({
-        id: client.cache.identify({ __typename: 'Message', id: updatedMessage.id }),
-        fields: {
-          status: () => updatedMessage.status,
-          updatedAt: () => updatedMessage.updatedAt
+      if (existingMessage && 
+          new Date(existingMessage.node.updatedAt) > new Date(data.data.messageAdded.updatedAt)) {
+        return;
+      }
+
+      // Обновляем кэш с новым сообщением
+      client.cache.writeQuery({
+        query: GET_MESSAGES,
+        variables: { first: MESSAGES_PER_PAGE },
+        data: {
+          messages: {
+            ...existing.messages,
+            edges: [
+              ...existing.messages.edges.filter(edge => edge.node.id !== data.data.messageAdded.id),
+              {
+                __typename: "MessageEdge",
+                node: data.data.messageAdded,
+                cursor: data.data.messageAdded.id
+              }
+            ]
+          }
         }
       });
     }
   });
 
+  // Подписка на обновления статусов сообщений
+  useSubscription(MESSAGE_UPDATED, {
+    onData: ({ client, data }) => {
+      if (!data.data?.messageUpdated) return;
+      
+      client.cache.modify({
+        id: client.cache.identify({
+          __typename: 'Message',
+          id: data.data.messageUpdated.id,
+          sender: data.data.messageUpdated.sender
+        }),
+        fields: {
+          status: () => data.data.messageUpdated.status,
+          updatedAt: () => data.data.messageUpdated.updatedAt
+        }
+      });
+    }
+  });
+
+  // Обработчик подгрузки следующих сообщений
+  const handleLoadMore = () => {
+    if (data?.messages.pageInfo.hasNextPage) {
+      fetchMore({
+        variables: {
+          after: data.messages.pageInfo.endCursor,
+          first: MESSAGES_PER_PAGE
+        },
+        updateQuery: (prev, { fetchMoreResult }) => {
+          if (!fetchMoreResult) return prev;
+          
+          return {
+            messages: {
+              __typename: "MessagePage",
+              // Объединяем предыдущие сообщения с новыми
+              edges: [...prev.messages.edges, ...fetchMoreResult.messages.edges],
+              // Обновляем информацию о пагинации
+              pageInfo: fetchMoreResult.messages.pageInfo
+            }
+          };
+        }
+      });
+    }
+  };
+
+  // Обработчик отправки сообщения
   const handleSendMessage = async () => {
     if (!inputText.trim()) return;
-    
     try {
       setInputText("");
       await sendMessage({ variables: { text: inputText } });
@@ -218,57 +182,15 @@ export const Chat: React.FC = () => {
     }
   };
 
-  const handleLoadMore = () => {
-    if (data?.messages.pageInfo.hasNextPage) {
-      fetchMore({
-        variables: {
-          after: data.messages.pageInfo.endCursor,
-          first: 20
-        },
-        updateQuery: (prev, { fetchMoreResult }) => {
-          if (!fetchMoreResult) return prev;
-          return {
-            messages: {
-              ...fetchMoreResult.messages,
-              edges: [
-                ...prev.messages.edges,
-                ...fetchMoreResult.messages.edges
-              ]
-            }
-          };
-        }
-      });
-    }
-  };
-
   if (error) return <div>Error loading messages</div>;
-
-  interface Edge {
-  node: Message;
-  cursor: string;
-}
-
-interface PageInfo {
-  endCursor: string | null;
-  hasNextPage: boolean;
-}
-
-interface MessagesData {
-  messages: {
-    edges: Edge[];
-    pageInfo: PageInfo;
-  };
-}
-
-const messages = data?.messages.edges.map((edge: Edge) => edge.node) || [];
 
   return (
     <div className={css.root}>
       <div className={css.container}>
         <Virtuoso 
           className={css.list} 
-          data={messages} 
-          itemContent={getItem}
+          data={data?.messages.edges.map(edge => edge.node) || []} 
+          itemContent={(_, data) => <MessageItem {...data} />}
           endReached={handleLoadMore}
           followOutput="auto"
         />
@@ -276,13 +198,14 @@ const messages = data?.messages.edges.map((edge: Edge) => edge.node) || [];
       <div className={css.footer}>
         <input
           type="text"
+          disabled={loading}
           className={css.textInput}
           placeholder="Message text"
           value={inputText}
           onChange={(e) => setInputText(e.target.value)}
           onKeyPress={(e) => e.key === 'Enter' && handleSendMessage()}
         />
-        <button onClick={handleSendMessage}>Send</button>
+        <button disabled={loading} onClick={handleSendMessage}>Send</button>
       </div>
     </div>
   );
